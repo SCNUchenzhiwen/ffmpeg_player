@@ -4,7 +4,7 @@ dist/mp4info.wasm.js:
 	-O3 \
 	-L/opt/ffmpeg/lib \
 	-I/opt/ffmpeg/include/ \
-	-s EXTRA_EXPORTED_RUNTIME_METHODS="[FS, cwrap, ccall, getValue, setValue, writeAsciiToMemory, addFunction]" \
+	-s EXTRA_EXPORTED_RUNTIME_METHODS="[FS, cwrap, ccall, getValue, setValue, writeAsciiToMemory, addFunction, WORKERFS]" \
 	-s INITIAL_MEMORY=268435456 \
 	-s ASSERTIONS=1 \
 	-s STACK_OVERFLOW_CHECK=2 \

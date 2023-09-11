@@ -2,6 +2,8 @@ FROM emscripten/emsdk:2.0.34 as build
 
 ARG FFMPEG_VERSION=5.1.3
 ARG X264_VERSION=20170226-2245-stable
+ARG X265_VERSION=x265-2.7
+ARG x265_DIR_NAME=multicoreware-x265-e41a9bf2bac4
 
 ARG PREFIX=/opt/ffmpeg
 ARG MAKEFLAGS="-j4"
@@ -23,6 +25,25 @@ RUN apt-get update && apt-get install -y autoconf libtool build-essential
 #   --extra-cflags="-s USE_PTHREADS=1"
 
 # RUN cd /tmp/x264-snapshot-${X264_VERSION} && \
+#   emmake make && emmake make install 
+
+# libx265
+# RUN cd /tmp && \
+#   wget http://ftp.videolan.org/pub/videolan/x265/${X265_VERSION}.tar.bz2 && \
+#   tar xvfj ${X265_VERSION}.tar.bz2 && \
+#   ls
+
+# RUN cd /tmp/${x265_DIR_NAME} && \
+#   emconfigure ./configure \
+#   --prefix=${PREFIX} \
+#   --disable-asm \
+#   --disable-thread \
+#   --disable-pthread \
+#   --disable-shared \
+#   --enable-static \
+#   --extra-cflags="-s USE_PTHREADS=1"
+
+# RUN cd /tmp/${x265_DIR_NAME} && \
 #   emmake make && emmake make install 
 
 # Get ffmpeg source.
@@ -61,10 +82,11 @@ RUN cd /tmp/ffmpeg-${FFMPEG_VERSION} && \
   --enable-swscale \
   --enable-filters \
   --enable-protocol=file \
-  --enable-decoder=h264,aac,pcm_s16le \
+  --enable-decoder=hevc,h264,aac,pcm_s16le \
   --enable-demuxer=mov,matroska \
   --enable-muxer=mp4 \
   --enable-gpl \
+  # --enable-libx265 \
   # --enable-libx264 \
   --extra-cflags="$CFLAGS" \
   --extra-cxxflags="$CFLAGS" \
