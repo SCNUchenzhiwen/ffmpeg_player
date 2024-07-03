@@ -10,13 +10,14 @@ const ACTION_TYPE_PLAY = 'ACTION_TYPE_PLAY'
 const ACTION_TYPE_FLUSH = 'ACTION_TYPE_FLUSH'
 const ACTION_TYPE_DECODE_FRAME = 'ACTION_TYPE_DECODE_FRAME'
 const ACTION_TYPE_STATUS_CHANGE = 'ACTION_TYPE_STATUS_CHANGE'
+const ACTION_TYPE_DECODE_AUDIO_FRAME = 'ACTION_TYPE_DECODE_AUDIO_FRAME'
 
 const DECODE_STATUS_NOT_BEGIN = 0
 const DECODE_STATUS_DECODING = 1
 const DECODE_STATUS_PAUSE = 2
 const DECODE_STATUS_FINISH = 3
 
-const pool_size = 10
+const pool_size = 2
 const decodeCount = pool_size / 2
 const pool = new Map()
 
@@ -25,6 +26,7 @@ let finish = false
 let decodeStatus = DECODE_STATUS_NOT_BEGIN
 
 let decoding = false
+
 
 const initHandler = ({ file, startTime = 0 }) => {
     const { FS, WORKERFS } = Module
@@ -42,6 +44,27 @@ const initHandler = ({ file, startTime = 0 }) => {
         postMessage({ type: ACTION_TYPE_STATUS_CHANGE, payload: status })
     }, 'vi')
     setDecodeStatusCallback(onDecodeStatusChange)
+    const setPCMDataCallback = Module.cwrap('setPCMDataCallback', null, ['function'])
+    const onPCMDataCallback = Module.addFunction((pcm_data_addr, dataSize, audio_count, channel, sample_rate) => {
+        const buffer = new Float32Array(Module.HEAPF32.buffer, pcm_data_addr, dataSize);
+
+        const arrayBuffer = new ArrayBuffer(dataSize * 4)
+        const typeBuffer = new Float32Array(arrayBuffer)
+        // const subBuff = Module.HEAPU8.subarray(pcm_data_addr, pcm_data_addr + dataSize)
+        typeBuffer.set(buffer)
+
+        const obj = {
+            data: typeBuffer,
+            dataSize,
+            sample_rate,
+            channel
+        }
+        console.log('一帧音频数据------------------------------------')
+        console.log(obj)
+        postMessage({ type: ACTION_TYPE_DECODE_AUDIO_FRAME, payload: obj }, [obj.data.buffer])
+    }, 'viiiii')
+    setPCMDataCallback(onPCMDataCallback)
+
     const setYUVDataCallback = Module.cwrap('setYUVDataCallback', null, ['function'])
     const onYUVData = Module.addFunction((yuv_arr_addr, decode_count, last_frame) => {
         const arrayOfPointers = [];
@@ -154,10 +177,10 @@ const initHandler = ({ file, startTime = 0 }) => {
     setYUVDataCallback(onYUVData)
     Module.init_decoder('/work/' + file.name);
     decodeStatus = DECODE_STATUS_NOT_BEGIN
-    decodeHandler(pool_size)
+    decodeHandler(pool_size, 0, 0)
 }
 
-const decodeHandler = (count) => {
+const decodeHandler = (count, videoStartTime = 0, audioStartTime = 0) => {
     if (decodeStatus === DECODE_STATUS_FINISH) {
         console.log('当前视频已解码了最后一帧------------>')
         return
@@ -169,7 +192,7 @@ const decodeHandler = (count) => {
     // const count = pool_size - pool.size
     console.time('解码---------------')
     decoding = true
-    Module.handle_decode_frame(count)
+    Module.handle_decode_frame(count, videoStartTime, audioStartTime)
     postMessage({ type: ACTION_TYPE_DECODE, payload: {} })
 }
 
@@ -211,7 +234,8 @@ onmessage = (e) => {
             initHandler(payload)
             break
         case ACTION_TYPE_DECODE:
-            decodeHandler(payload)
+            const { count, videoStartTime, audioStartTime } = payload
+            decodeHandler(count, videoStartTime, audioStartTime)
             break
         case ACTION_TYPE_PLAY:
             playHandler(payload)
