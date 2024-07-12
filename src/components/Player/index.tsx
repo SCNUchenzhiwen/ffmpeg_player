@@ -1,4 +1,4 @@
-import React, { FormEvent, useEffect, useRef, useLayoutEffect, useCallback } from 'react'
+import React, { FormEvent, useEffect, useRef, useLayoutEffect, useCallback, useState } from 'react'
 import { initWorker, type IWorker } from './workerInstance'
 import YUVCanvas from 'yuv-canvas'
 import decoder from '../../libs/decoder/decoder'
@@ -12,11 +12,16 @@ const ACTION_TYPE_FLUSH = 'ACTION_TYPE_FLUSH'
 const ACTION_TYPE_DECODE_FRAME = 'ACTION_TYPE_DECODE_FRAME'
 const ACTION_TYPE_STATUS_CHANGE = 'ACTION_TYPE_STATUS_CHANGE'
 const ACTION_TYPE_DECODE_AUDIO_FRAME = 'ACTION_TYPE_DECODE_AUDIO_FRAME'
+const ACTION_TYPE_FINISH_DECODE = 'ACTION_TYPE_FINISH_DECODE'
+const ACTION_TYPE_GET_FRAME = "ACTION_TYPE_GET_FRAME";
+const ACTION_TYPE_POST_FRAME = "ACTION_TYPE_POST_FRAME";
 
 const DECODE_STATUS_NOT_BEGIN = 0
 const DECODE_STATUS_DECODING = 1
 const DECODE_STATUS_PAUSE = 2
 const DECODE_STATUS_FINISH = 3
+
+  const audioContext = new AudioContext()
 
 const Player = () => {
   const worker = useRef<{ value: IWorker }>({ value: {} as IWorker })
@@ -24,17 +29,22 @@ const Player = () => {
   const yuv = useRef<{ value: Record<string, any> }>({ value: {} })
   const playTimer = useRef<any>(null)
   const workerPlayCb = useRef<any>(null)
-  const decodeFramePool = useRef<any>([])
+  const decodeFramePool = useRef<any[]>([])
   const framePool = useRef<any>([])
   const decodeAudioFramePool = useRef<any>([])
   const audioFramePool = useRef<any[]>([])
   const decodeStatus = useRef<number>(0)
   const lastVideoTimeStamp = useRef<number>(0)
   const lastAudioTimeStamp = useRef<number>(0)
-
+  const currentPlayTimestamp = useRef(0)
+  const preRafTimestamp = useRef(0)
+  const preTime = useRef(0)
+  const currRafTimestamp = useRef(0)
+  const nextPlayTimestamp = useRef(0)
+  const playOffset = 3
+  const [rate, setRate] = useState(0)
+  const rafAvgTimeInterval = useRef(0)
   const playStatus = useRef<string>('not_begin')
-
-  const audioContext = new AudioContext()
 
   const onChange = (e: FormEvent) => {
     const file = (e.target as HTMLInputElement).files![0]
@@ -65,12 +75,6 @@ const Player = () => {
   }
 
   const play = async (timestamp = 0) => {
-    // let beginTimestamp = 0
-    // const interval = 40
-    // let count = 0
-    // let currentTimestamp = beginTimestamp
-    // const frame = await getFrame(timestamp)
-    // drawYUV(frame)
     const frame = framePool.current.shift()
     if (frame) {
       drawYUV(frame)
@@ -81,16 +85,6 @@ const Player = () => {
         worker.current.value.worker.postMessage({ type: ACTION_TYPE_DECODE, payload: { count: 24 - framePool.current.length, videoStartTime: lastVideoTimeStamp.current, audioStartTime: lastVideoTimeStamp.current } })
       }
     }
-
-    setTimeout(() => {
-      if (decodeStatus.current === DECODE_STATUS_FINISH && !frame) {
-        worker.current.value.worker.postMessage({ type: ACTION_TYPE_FLUSH, payload: 24 - framePool.current.length })
-        framePool.current = []
-        decodeFramePool.current = []
-        return
-      }
-      play(timestamp + 40)
-    }, 40)
   }
 
   const playAudioFrame = () => {
@@ -110,9 +104,9 @@ const Player = () => {
     for (let channel = 0; channel < channels; channel++) {
       let nowBuffering = audioBuffer.getChannelData(channel);
       for (var i = 0; i < buffer.length / channels; i++) {
-          nowBuffering[i] = buffer[i * channels + channel];
+        nowBuffering[i] = buffer[i * channels + channel];
       }
-  }
+    }
 
     const source = audioContext.createBufferSource();
     source.buffer = audioBuffer;
@@ -122,25 +116,81 @@ const Player = () => {
     source.onended = () => {
       console.log('结束')
     };
-
-
-    // 将 pcmData 数据填充到 AudioBuffer 中
-    // for (let channel = 0; channel < 2; channel++) {
-    //   const bufferData = audioBuffer.getChannelData(channel);
-    //   for (let i = 0; i < dataSize / 2; i++) {
-    //     bufferData[i] = data[i * 2 + channel];
-    //   }
-    // }
-
-    // audioBuffer.copyToChannel(data, 0)
-    // audioBuffer.copyToChannel(data, 1)
   }
-
-  const playAudio = () => { }
 
   const saveAudioBuffer = (audioFrame: Record<string, any>) => {
     decodeAudioFramePool.current.push(audioFrame)
     playAudioFrame()
+  }
+
+  const handleDecode = (timestamp = 0, count = 48) => {
+    worker.current.value.worker.postMessage({ type: ACTION_TYPE_DECODE, payload: { count, videoStartTime: timestamp, audioStartTime: timestamp } })
+  }
+
+  const handleGetPlayFrame = (timestamp = 0) => {
+    console.time("获取一帧时间")
+    worker.current.value.worker.postMessage({ type: ACTION_TYPE_GET_FRAME, payload: timestamp })
+  }
+
+  const onReceiveFrame = (frameDetail: any) => {
+    console.log(frameDetail)
+    console.timeEnd("获取一帧时间")
+    decodeFramePool.current = frameDetail
+    decodeFramePool.current.sort((a: any, b: any) => a.playTimestamp - b.playTimestamp)
+    playFrame()
+  }
+
+  const onFinishDecode = ({ count }: { count: number }) => {
+    console.log('解码数量: ', count)
+    handleGetPlayFrame(0)
+  }
+
+  const playFrame = () => {
+    let count = 0
+    let rafCount = 0
+    drawYUV(decodeFramePool.current[0])
+    const play = () => {
+      requestAnimationFrame(() => {
+        console.time("整体逻辑耗时")
+        console.time("前置运算")
+        const currentTime = new Date().getTime()
+        if (!preTime.current) {
+          preTime.current = currentTime
+        }
+        currRafTimestamp.current = currentTime - preTime.current
+        console.log('当前currRafTimestamp', currRafTimestamp.current)
+        rafCount && (rafAvgTimeInterval.current = currRafTimestamp.current / rafCount)
+        console.log('raf平局时间间隔', rafAvgTimeInterval.current)
+
+        const lastFrame = decodeFramePool.current.slice(-1)[0]
+        if (!lastFrame || currRafTimestamp.current > lastFrame.playTimestamp) {
+          return
+        }
+        console.timeEnd("前置运算")
+        console.time("遍历耗时")
+        const frameIndex = decodeFramePool.current.findIndex(item => item.playTimestamp >= currRafTimestamp.current && item.playTimestamp <= currRafTimestamp.current + rafAvgTimeInterval.current)
+        console.timeEnd("遍历耗时")
+        if (frameIndex > -1) {
+          const frame = decodeFramePool.current[frameIndex]
+          console.log('当前playtimestamp', frame.playTimestamp)
+          console.time("绘制耗时")
+          drawYUV(frame)
+          console.timeEnd("绘制耗时")
+          console.time("处理数组耗时")
+          decodeFramePool.current = decodeFramePool.current.slice(frameIndex + 1)
+          count++
+          currRafTimestamp.current && setRate(Math.round(1000 * count / currRafTimestamp.current))
+          console.timeEnd("处理数组耗时")
+        }
+
+        rafCount++
+
+        console.timeEnd("整体逻辑耗时")
+
+        play()
+      })
+    }
+    play()
   }
 
   const onMessage = useCallback((e: { data: { type: string, payload: any } }) => {
@@ -148,10 +198,11 @@ const Player = () => {
     switch (type) {
       case ACTION_TYPE_INIT:
         console.log('初始化解码器成功----')
+        handleDecode()
         // handlePlay(0)
         setTimeout(() => {
-          play()
-          playAudioFrame()
+          // play()
+          // playAudioFrame()
         }, 1000)
 
         break
@@ -185,6 +236,12 @@ const Player = () => {
       case ACTION_TYPE_DECODE_AUDIO_FRAME:
         saveAudioBuffer(payload)
         break
+      case ACTION_TYPE_FINISH_DECODE:
+        onFinishDecode(payload)
+        break
+      case ACTION_TYPE_POST_FRAME:
+        onReceiveFrame(payload)
+        break
     }
   }, [])
 
@@ -199,6 +256,7 @@ const Player = () => {
 
   const drawYUV = (frameDetail: any) => {
     console.log('渲染一帧--------------------------------------->', new Date().getTime())
+    console.log(frameDetail.playTimestamp)
     yuv.current.value.clear()
     yuv.current.value.drawFrame(frameDetail)
     frameDetail = null
@@ -253,6 +311,7 @@ const Player = () => {
     <div className="player-wrapper">
       <input id="file" type="file" onChange={onChange} placeholder='选择文件' />
       <input id="file" type="file" onChange={onAacChange} placeholder='选择aac文件' />
+      <div>{rate}</div>
       <div className="canvas-wrapper">
         <canvas className="canvas" ref={canvas} />
       </div>
