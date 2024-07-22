@@ -15,13 +15,15 @@ const ACTION_TYPE_DECODE_AUDIO_FRAME = 'ACTION_TYPE_DECODE_AUDIO_FRAME'
 const ACTION_TYPE_FINISH_DECODE = 'ACTION_TYPE_FINISH_DECODE'
 const ACTION_TYPE_GET_FRAME = "ACTION_TYPE_GET_FRAME";
 const ACTION_TYPE_POST_FRAME = "ACTION_TYPE_POST_FRAME";
+const ACTION_TYPE_ON_RELEASE_FRAME = "ACTION_TYPE_ON_RELEASE_FRAME";
+const ACTION_TYPE_RELEASE_FRAME = "ACTION_TYPE_RELEASE_FRAME";
 
 const DECODE_STATUS_NOT_BEGIN = 0
 const DECODE_STATUS_DECODING = 1
 const DECODE_STATUS_PAUSE = 2
 const DECODE_STATUS_FINISH = 3
 
-  const audioContext = new AudioContext()
+const audioContext = new AudioContext()
 
 const Player = () => {
   const worker = useRef<{ value: IWorker }>({ value: {} as IWorker })
@@ -45,6 +47,13 @@ const Player = () => {
   const [rate, setRate] = useState(0)
   const rafAvgTimeInterval = useRef(0)
   const playStatus = useRef<string>('not_begin')
+  const releaseDecodeFrames = useRef<Map<string, any>>(new Map())
+  let currentReleaseDecodeFramePromiseResolve = useRef<any>(null)
+  let decodeFramePromiseResolve = useRef<any>(null)
+  const getPlayFramePromiseResolve = useRef<any>(null)
+  const decodeByDrawYUVStatus = useRef('WAITING')
+
+  const MAX_DECODE_FRAME_COUNT = 48
 
   const onChange = (e: FormEvent) => {
     const file = (e.target as HTMLInputElement).files![0]
@@ -123,26 +132,82 @@ const Player = () => {
     playAudioFrame()
   }
 
-  const handleDecode = (timestamp = 0, count = 48) => {
-    worker.current.value.worker.postMessage({ type: ACTION_TYPE_DECODE, payload: { count, videoStartTime: timestamp, audioStartTime: timestamp } })
+  const handleReleaseDecodeFrames = async () => {
+    return new Promise(resolve => {
+      const bufferArr = [] as Transferable[];
+      Array.from(releaseDecodeFrames.current.values()).forEach(item => {
+        const { y, u, v } = item;
+        bufferArr.push(y.bytes.buffer);
+        bufferArr.push(u.bytes.buffer);
+        bufferArr.push(v.bytes.buffer);
+      })
+      worker.current.value.worker.postMessage({ type: ACTION_TYPE_RELEASE_FRAME, payload: releaseDecodeFrames.current }, bufferArr)
+      currentReleaseDecodeFramePromiseResolve.current = resolve
+    })
+  }
+
+  const onReleaseDecodeFrames = () => {
+    currentReleaseDecodeFramePromiseResolve.current && currentReleaseDecodeFramePromiseResolve.current()
+    currentReleaseDecodeFramePromiseResolve.current = null
+    releaseDecodeFrames.current.clear()
+  }
+
+  const decodeNextFrame = async () => {
+    const lastFrameItem = decodeFramePool.current.slice(-1)[0]
+    let timestamp = 0
+    if (lastFrameItem) {
+      timestamp = lastFrameItem.playTimestamp
+    }
+    const decodeCount = MAX_DECODE_FRAME_COUNT - decodeFramePool.current.length
+
+    const beginTimestamp = await handleDecode(timestamp, decodeCount)
+    await handleGetPlayFrame(beginTimestamp)
+  }
+
+  const handelDecodeByDrawYUV = async () => {
+    if (decodeByDrawYUVStatus.current !== 'WAITING') return
+    if (decodeFramePool.current.length <= MAX_DECODE_FRAME_COUNT / 2) {
+      decodeByDrawYUVStatus.current = 'DECODING'
+      await handleReleaseDecodeFrames()
+      await decodeNextFrame()
+      decodeByDrawYUVStatus.current = 'WAITING'
+    }
+  }
+
+  const handleDecode = (timestamp = 0, count = MAX_DECODE_FRAME_COUNT) => {
+    return new Promise<number>(resolve => {
+      worker.current.value.worker.postMessage({ type: ACTION_TYPE_DECODE, payload: { count, videoStartTime: timestamp, audioStartTime: timestamp } })
+      decodeFramePromiseResolve.current = resolve
+    })
   }
 
   const handleGetPlayFrame = (timestamp = 0) => {
-    console.time("获取一帧时间")
-    worker.current.value.worker.postMessage({ type: ACTION_TYPE_GET_FRAME, payload: timestamp })
+    return new Promise((resolve) => {
+      console.log("handleGetPlayFrame-----------------------------------------------------------")
+      worker.current.value.worker.postMessage({ type: ACTION_TYPE_GET_FRAME, payload: timestamp })
+      getPlayFramePromiseResolve.current = resolve
+    })
+
   }
 
   const onReceiveFrame = (frameDetail: any) => {
-    console.log(frameDetail)
-    console.timeEnd("获取一帧时间")
-    decodeFramePool.current = frameDetail
+    decodeFramePool.current.push(...frameDetail)
     decodeFramePool.current.sort((a: any, b: any) => a.playTimestamp - b.playTimestamp)
-    playFrame()
+    console.log('当前解码池长度')
+    console.log(decodeFramePool.current.length)
+    console.log(decodeFramePool)
+    getPlayFramePromiseResolve.current && getPlayFramePromiseResolve.current()
   }
 
-  const onFinishDecode = ({ count }: { count: number }) => {
+  const onFinishDecode = ({ count, beginTimestamp }: { count: number, beginTimestamp: number }) => {
+    decodeFramePromiseResolve.current && decodeFramePromiseResolve.current(beginTimestamp)
+    decodeFramePromiseResolve.current = null
     console.log('解码数量: ', count)
-    handleGetPlayFrame(0)
+  }
+
+  const handleInitPlay = async () => {
+    await handleDecode()
+    handleGetPlayFrame()
   }
 
   const playFrame = () => {
@@ -151,8 +216,6 @@ const Player = () => {
     drawYUV(decodeFramePool.current[0])
     const play = () => {
       requestAnimationFrame(() => {
-        console.time("整体逻辑耗时")
-        console.time("前置运算")
         const currentTime = new Date().getTime()
         if (!preTime.current) {
           preTime.current = currentTime
@@ -166,26 +229,19 @@ const Player = () => {
         if (!lastFrame || currRafTimestamp.current > lastFrame.playTimestamp) {
           return
         }
-        console.timeEnd("前置运算")
-        console.time("遍历耗时")
         const frameIndex = decodeFramePool.current.findIndex(item => item.playTimestamp >= currRafTimestamp.current && item.playTimestamp <= currRafTimestamp.current + rafAvgTimeInterval.current)
-        console.timeEnd("遍历耗时")
         if (frameIndex > -1) {
           const frame = decodeFramePool.current[frameIndex]
           console.log('当前playtimestamp', frame.playTimestamp)
-          console.time("绘制耗时")
           drawYUV(frame)
-          console.timeEnd("绘制耗时")
-          console.time("处理数组耗时")
+          releaseDecodeFrames.current.set(frame.playTimestamp, frame)
+          handelDecodeByDrawYUV()
           decodeFramePool.current = decodeFramePool.current.slice(frameIndex + 1)
           count++
           currRafTimestamp.current && setRate(Math.round(1000 * count / currRafTimestamp.current))
-          console.timeEnd("处理数组耗时")
         }
 
         rafCount++
-
-        console.timeEnd("整体逻辑耗时")
 
         play()
       })
@@ -198,7 +254,7 @@ const Player = () => {
     switch (type) {
       case ACTION_TYPE_INIT:
         console.log('初始化解码器成功----')
-        handleDecode()
+        handleInitPlay()
         // handlePlay(0)
         setTimeout(() => {
           // play()
@@ -242,6 +298,9 @@ const Player = () => {
       case ACTION_TYPE_POST_FRAME:
         onReceiveFrame(payload)
         break
+      case ACTION_TYPE_ON_RELEASE_FRAME:
+        onReleaseDecodeFrames()
+        break
     }
   }, [])
 
@@ -259,7 +318,6 @@ const Player = () => {
     console.log(frameDetail.playTimestamp)
     yuv.current.value.clear()
     yuv.current.value.drawFrame(frameDetail)
-    frameDetail = null
   }
 
   const onAacChange = async (event: FormEvent<HTMLInputElement>) => {
@@ -312,6 +370,7 @@ const Player = () => {
       <input id="file" type="file" onChange={onChange} placeholder='选择文件' />
       <input id="file" type="file" onChange={onAacChange} placeholder='选择aac文件' />
       <div>{rate}</div>
+      <button onClick={playFrame}>播放</button>
       <div className="canvas-wrapper">
         <canvas className="canvas" ref={canvas} />
       </div>

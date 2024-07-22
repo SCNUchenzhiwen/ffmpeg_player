@@ -14,6 +14,8 @@ const ACTION_TYPE_STATUS_CHANGE = "ACTION_TYPE_STATUS_CHANGE";
 const ACTION_TYPE_DECODE_AUDIO_FRAME = "ACTION_TYPE_DECODE_AUDIO_FRAME";
 const ACTION_TYPE_POST_FRAME = "ACTION_TYPE_POST_FRAME";
 const ACTION_TYPE_FINISH_DECODE = "ACTION_TYPE_FINISH_DECODE";
+const ACTION_TYPE_RELEASE_FRAME = "ACTION_TYPE_RELEASE_FRAME";
+const ACTION_TYPE_ON_RELEASE_FRAME = "ACTION_TYPE_ON_RELEASE_FRAME";
 
 const DECODE_STATUS_NOT_BEGIN = 0;
 const DECODE_STATUS_DECODING = 1;
@@ -30,7 +32,9 @@ let decodeStatus = DECODE_STATUS_NOT_BEGIN;
 
 let decoding = false;
 
-const yuvArrayPool = [];
+const taskQueue = [];
+
+let yuvArrayPool = [];
 let yuvReleaseArrayBufferPool = [];
 let hasInitPool = false;
 let currentDecodeYuvPlaystartTime = 0;
@@ -62,10 +66,13 @@ const initYuvArrayBufferByDecode = (linesizeY, height) => {
 };
 const clearYuvObjBuffer = (yuvObj) => {
   const { y, u, v } = yuvObj;
+  y.bytes.buffer.detached = false
+  u.bytes.buffer.detached = false
+  v.bytes.buffer.detached = false
   yuvReleaseArrayBufferPool.unshift({
-    y_typeArr: y,
-    u_typeArr: u,
-    v_typeArr: v,
+    y_typeArr: y.bytes,
+    u_typeArr: u.bytes,
+    v_typeArr: v.bytes,
   });
 };
 const clearYuvObjBufferByIndexScope = (start, end) => {
@@ -84,6 +91,22 @@ const updateYuvPoolPlayTimeRang = () => {
     currentDecodeYuvPlaystartTime = startYuvItem.playTimestamp;
     currentDecodeYuvPlayEndTime = lastYuvItem.playTimestamp;
   }
+};
+
+const releaseYuvArrayPool = (releaseDecodeFramesMap) => {
+  yuvArrayPool = []
+
+  const releaseDecodeFrames = Array.from(releaseDecodeFramesMap.values())
+  for (let i = 0; i < releaseDecodeFrames.length; i++) {
+    clearYuvObjBuffer(releaseDecodeFrames[i])
+  }
+
+  updateYuvPoolPlayTimeRang()
+  console.log(yuvReleaseArrayBufferPool)
+  postMessage({
+    type: ACTION_TYPE_ON_RELEASE_FRAME,
+    payload: {},
+  });
 };
 
 const initHandler = ({ file, startTime = 0 }) => {
@@ -170,7 +193,9 @@ const initHandler = ({ file, startTime = 0 }) => {
         };
 
         initYuvArrayBufferByDecode(linesizeY, height);
+        console.log(yuvReleaseArrayBufferPool)
         const releaseArrayBuffer = yuvReleaseArrayBufferPool.pop();
+        console.log(releaseArrayBuffer)
 
         const y_subBuff = Module.HEAPU8.subarray(
           dataYPtr,
@@ -209,21 +234,15 @@ const initHandler = ({ file, startTime = 0 }) => {
           lastFrame: 0,
           end: i === decodeCount - 1,
         };
-        // console.log('主动推送---->', new Date().getTime())
-        // postMessage({ type: ACTION_TYPE_DECODE_FRAME, payload: buffObj }, [
-        //   buffObj.y.bytes.buffer,
-        //   buffObj.u.bytes.buffer,
-        //   buffObj.v.bytes.buffer,
-        // ]);
+
         yuvArrayPool.push(buffObj);
       }
-
+      yuvArrayPool.sort((a, b) => a.playTimestamp - b.playTimestamp)
       updateYuvPoolPlayTimeRang();
-
-      console.log("解码帧数", decode_count);
-      console.timeEnd("解码---------------");
-
-      postMessage({ type: ACTION_TYPE_FINISH_DECODE, payload: { count: decode_count } })
+      postMessage({
+        type: ACTION_TYPE_FINISH_DECODE,
+        payload: { count: decode_count, beginTimestamp: currentDecodeYuvPlaystartTime },
+      });
     },
     "viii"
   );
@@ -231,17 +250,20 @@ const initHandler = ({ file, startTime = 0 }) => {
   Module.init_decoder("/work/" + file.name);
 
   setTimeout(() => {
-    postMessage({ type: ACTION_TYPE_INIT })
-  }, 1000)
+    postMessage({ type: ACTION_TYPE_INIT });
+  }, 1000);
 };
 
 const decodeHandler = (count, videoStartTime = 0, audioStartTime = 0) => {
-  console.time("解码---------------");
-  Module.handle_decode_frame(count, videoStartTime, audioStartTime);
+  const _count = yuvReleaseArrayBufferPool.length ? Math.min(count, yuvReleaseArrayBufferPool.length) : count
+  Module.handle_decode_frame(_count, videoStartTime, audioStartTime);
 };
 
 const getPlayFrame = (targetTimestamp = 0) => {
-  console.time("获取帧遍历耗时")
+  console.log("getPlayFrame----------------------------------------")
+  console.log(targetTimestamp)
+  console.log(currentDecodeYuvPlaystartTime)
+  console.log(currentDecodeYuvPlayEndTime)
   const hasYuvFrame =
     targetTimestamp >= currentDecodeYuvPlaystartTime &&
     targetTimestamp <= currentDecodeYuvPlayEndTime;
@@ -254,17 +276,19 @@ const getPlayFrame = (targetTimestamp = 0) => {
         break;
       }
     }
-    const playYuvItem = yuvArrayPool[frameIndex];
-    clearYuvObjBufferByIndexScope(0, frameIndex - 1);
-    console.timeEnd("获取帧遍历耗时")
-    const bufferArr = []
-    for (let i = frameIndex; i < yuvArrayPool.length; i++) {
-      const { y, u, v } = yuvArrayPool[i]
-      bufferArr.push(y.bytes.buffer)
-      bufferArr.push(u.bytes.buffer)
-      bufferArr.push(v.bytes.buffer)
+
+    yuvArrayPool = yuvArrayPool.slice(frameIndex)
+    const bufferArr = [];
+    for (let i = 0; i < yuvArrayPool.length; i++) {
+      const { y, u, v } = yuvArrayPool[i];
+      !y.bytes.buffer.detached && bufferArr.push(y.bytes.buffer);
+      !u.bytes.buffer.detached && bufferArr.push(u.bytes.buffer);
+      !v.bytes.buffer.detached && bufferArr.push(v.bytes.buffer);
     }
-    postMessage({ type: ACTION_TYPE_POST_FRAME, payload: yuvArrayPool.slice(frameIndex) }, bufferArr);
+    postMessage(
+      { type: ACTION_TYPE_POST_FRAME, payload: yuvArrayPool.slice(frameIndex) },
+      bufferArr
+    );
   }
 };
 
@@ -294,6 +318,9 @@ onmessage = (e) => {
     case ACTION_TYPE_FLUSH:
       flushHandler;
       break;
+    case ACTION_TYPE_RELEASE_FRAME:
+      releaseYuvArrayPool(payload)
+      break
   }
 };
 
